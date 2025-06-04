@@ -1,0 +1,25 @@
+{
+  "websites": [
+    "https://hospitalogy.com/"
+  ],
+  "keywords": {
+    "payer_keywords": [
+      "payer", "insurance", "medicaid", "medicare", "health plan",
+      "coverage", "reimbursement", "payment", "claims", "benefits",
+      "premium", "deductible", "copay", "prior authorization",
+      "value-based care", "risk adjustment", "medical economics"
+    ],
+    "innovation_keywords": [
+      "innovation", "technology", "digital health", "AI", "artificial intelligence",
+      "machine learning", "telehealth", "telemedicine", "mobile health", "mHealth",
+      "blockchain", "cloud", "analytics", "data", "platform", "startup",
+      "venture capital", "funding", "partnership", "collaboration",
+      "interoperability", "API", "integration", "automation"
+    ]
+  },
+  "scheduling": {
+    "day_of_week": "monday",
+    "time": "09:00",
+    "timezone": "UTC"
+  }
+}
