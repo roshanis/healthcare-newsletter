@@ -1,6 +1,18 @@
 {
   "websites": [
-    "https://hospitalogy.com/"
+    "https://hospitalogy.com/",
+    "https://www.statnews.com/",
+    "https://kffhealthnews.org/",
+    "https://www.healthcaredive.com/",
+    "https://www.fiercehealthcare.com/",
+    "https://www.healthcareitnews.com/",
+    "https://www.mobihealthnews.com/",
+    "https://www.fiercebiotech.com/",
+    "https://www.beckershospitalreview.com/",
+    "https://www.modernhealthcare.com/",
+    "https://www.medpagetoday.com/",
+    "https://www.reuters.com/health",
+    "https://endpoints.news/"
   ],
   "keywords": {
     "payer_keywords": [
