@@ -5,27 +5,32 @@ Generates weekly newsletters focused on healthcare payer news and innovation
 from hospitalogy.com and other configurable sources.
 """
 
-import requests
-from bs4 import BeautifulSoup
-import openai
-from datetime import datetime, timedelta
-import json
-import re
-import schedule
-import time
-import logging
-from typing import List, Dict, Optional
-from dataclasses import dataclass
+import html
 import os
+import re
+import json
+import time
+import smtplib
+import logging
+import schedule
+import requests
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Set
+from dataclasses import dataclass
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import smtplib
+from urllib.parse import urlparse
+
+import openai
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from pathlib import Path
+
 from security_utils import (
-    SecurityValidator, SecureFileHandler, SecureHTTPClient, 
+    SecurityValidator, SecureFileHandler, SecureHTTPClient,
     SecurityError, secure_json_loads, setup_secure_logging, RateLimiter
 )
+from website_scrapers import ScraperManager, Article as ScraperArticle
 
 # Setup secure logging
 security_logger = setup_secure_logging()
@@ -49,7 +54,7 @@ class NewsletterGenerator:
         self.file_handler = SecureFileHandler()
         self.http_client = SecureHTTPClient()
         self.rate_limiter = RateLimiter(max_requests=50, time_window=3600)  # 50 requests per hour
-        
+        self.scraper_manager = ScraperManager()
         self.config = self.load_config(config_path)
         
         # Get OpenAI API key from environment with validation
@@ -80,76 +85,104 @@ class NewsletterGenerator:
         
     def load_config(self, config_path: str) -> Dict:
         """Load configuration from JSON file and environment variables with security validation"""
+        project_root = Path(__file__).resolve().parent
+        config_path_obj = Path(config_path)
+        if not config_path_obj.is_absolute():
+            config_path_obj = Path.cwd() / config_path_obj
         try:
-            # Validate config file path
-            validated_path = SecurityValidator.validate_filename(config_path)
-            
-            # Default configuration with validated environment variables
-            default_config = {
-                "websites": ["https://hospitalogy.com/"],
-                "email_settings": {
-                    "smtp_server": os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com"),
-                    "smtp_port": int(os.getenv("EMAIL_SMTP_PORT", "587")),
-                    "from_email": "",
-                    "password": "",
-                    "to_emails": []
-                },
-                "newsletter_settings": {
-                    "name": os.getenv("NEWSLETTER_NAME", "Healthcare Weekly Newsletter"),
-                    "organization": os.getenv("ORGANIZATION_NAME", "")
-                }
+            config_path_obj = config_path_obj.resolve(strict=True)
+        except FileNotFoundError as exc:
+            security_logger.error(f"Configuration file not found: {config_path}")
+            raise FileNotFoundError(f"Configuration file not found: {config_path}") from exc
+
+        try:
+            config_path_obj.relative_to(project_root)
+        except ValueError as exc:
+            security_logger.error("Configuration path must stay within the project directory")
+            raise ValueError("Configuration path must stay within the project directory") from exc
+
+        if config_path_obj.stat().st_size > 64 * 1024:
+            security_logger.error("Configuration file exceeds 64KB safety limit")
+            raise ValueError("Configuration file exceeds 64KB limit")
+
+        # Default configuration with validated environment variables
+        default_config = {
+            "websites": ["hospitalogy"],
+            "email_settings": {
+                "smtp_server": os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com"),
+                "smtp_port": int(os.getenv("EMAIL_SMTP_PORT", "587")),
+                "from_email": "",
+                "password": "",
+                "to_emails": []
+            },
+            "newsletter_settings": {
+                "name": os.getenv("NEWSLETTER_NAME", "Healthcare Weekly Newsletter"),
+                "organization": os.getenv("ORGANIZATION_NAME", "")
             }
-            
-            # Validate and set email settings from environment
-            email_from = os.getenv("EMAIL_FROM", "")
-            if email_from:
-                try:
-                    default_config["email_settings"]["from_email"] = SecurityValidator.sanitize_email(email_from)
-                except SecurityError as e:
-                    security_logger.error(f"Invalid email address in EMAIL_FROM: {e}")
-                    raise ValueError(f"Invalid email configuration: {e}")
-            
-            email_password = os.getenv("EMAIL_PASSWORD", "")
-            if email_password:
-                if len(email_password) < 8:  # Basic password length check
-                    security_logger.error("Email password appears too short")
-                    raise ValueError("Email password appears to be invalid")
-                default_config["email_settings"]["password"] = email_password
-            
-            email_to = os.getenv("EMAIL_TO", "")
-            if email_to:
-                to_emails = []
-                for email in email_to.split(","):
-                    email = email.strip()
-                    if email:
-                        try:
-                            to_emails.append(SecurityValidator.sanitize_email(email))
-                        except SecurityError as e:
-                            security_logger.error(f"Invalid email address in EMAIL_TO: {email}")
-                            raise ValueError(f"Invalid recipient email: {e}")
-                default_config["email_settings"]["to_emails"] = to_emails
-            
-            # Try to load additional config from JSON file
+        }
+
+        # Validate and set email settings from environment
+        email_from = os.getenv("EMAIL_FROM", "")
+        if email_from:
             try:
-                file_content = self.file_handler.safe_read_file(validated_path, max_size=64*1024)  # 64KB max
-                file_config = secure_json_loads(file_content)
-                
-                # Merge configurations (file config takes precedence for non-sensitive data)
-                for key, value in file_config.items():
-                    if key not in ["openai_api_key"] and key != "email_settings":
-                        default_config[key] = value
-                        
-            except SecurityError as e:
-                security_logger.error(f"Security error loading config: {e}")
-                raise ValueError(f"Configuration security error: {e}")
-            except FileNotFoundError:
-                logger.info(f"Config file {config_path} not found. Using environment variables and defaults.")
-            
-            return default_config
-            
-        except Exception as e:
-            security_logger.error(f"Error loading configuration: {e}")
-            raise
+                default_config["email_settings"]["from_email"] = SecurityValidator.sanitize_email(email_from)
+            except SecurityError as exc:
+                security_logger.error(f"Invalid email address in EMAIL_FROM: {exc}")
+                raise ValueError(f"Invalid email configuration: {exc}") from exc
+
+        email_password = os.getenv("EMAIL_PASSWORD", "")
+        if email_password:
+            if len(email_password) < 8:  # Basic password length check
+                security_logger.error("Email password appears too short")
+                raise ValueError("Email password appears to be invalid")
+            default_config["email_settings"]["password"] = email_password
+
+        email_to = os.getenv("EMAIL_TO", "")
+        if email_to:
+            to_emails = []
+            for email in email_to.split(","):
+                email = email.strip()
+                if email:
+                    try:
+                        to_emails.append(SecurityValidator.sanitize_email(email))
+                    except SecurityError as exc:
+                        security_logger.error(f"Invalid email address in EMAIL_TO: {email}")
+                        raise ValueError(f"Invalid recipient email: {exc}") from exc
+            default_config["email_settings"]["to_emails"] = to_emails
+
+        try:
+            file_content = config_path_obj.read_text(encoding='utf-8')
+        except UnicodeDecodeError as exc:
+            security_logger.error("Configuration file must be UTF-8 encoded")
+            raise ValueError("Configuration file must be UTF-8 encoded") from exc
+
+        try:
+            file_config = secure_json_loads(file_content)
+        except SecurityError as exc:
+            security_logger.error(f"Security error loading config: {exc}")
+            raise ValueError(f"Configuration security error: {exc}") from exc
+
+        for key, value in file_config.items():
+            if key == "email_settings":
+                continue  # Prevent overriding sensitive values from file
+            if key not in ["openai_api_key"]:
+                default_config[key] = value
+
+        websites = default_config.get("websites", [])
+        if not isinstance(websites, list):
+            raise ValueError("Config error: 'websites' must be a list")
+
+        default_config["websites"] = [str(site).strip() for site in websites if str(site).strip()]
+        logger.info(f"Loaded configuration from {config_path_obj}")
+
+        return default_config
+    
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        """Collapse whitespace and trim text for consistent formatting"""
+        if not isinstance(value, str):
+            return ""
+        return re.sub(r'\s+', ' ', value).strip()
     
     def scrape_hospitalogy(self) -> List[Article]:
         """Scrape articles from hospitalogy.com with security controls"""
@@ -185,8 +218,7 @@ class NewsletterGenerator:
                         
                         validated_url = SecurityValidator.validate_url(href)
                         
-                        title = link.get_text(strip=True)
-                        title = SecurityValidator.sanitize_html(title)
+                        title = self._normalize_text(link.get_text(strip=True))
                         
                         if title and len(title) > 10 and len(title) < 500:  # Reasonable title length
                             article = self.scrape_article_content(validated_url, title)
@@ -214,7 +246,7 @@ class NewsletterGenerator:
         try:
             # Validate inputs
             validated_url = SecurityValidator.validate_url(url)
-            sanitized_title = SecurityValidator.sanitize_html(title)
+            normalized_title = self._normalize_text(title)
             
             # Rate limiting for individual articles
             if not self.rate_limiter.is_allowed(f"article_{validated_url}"):
@@ -246,14 +278,13 @@ class NewsletterGenerator:
                 paragraphs = soup.find_all('p')
                 content = ' '.join([p.get_text(strip=True) for p in paragraphs])
             
-            # Sanitize and limit content
-            content = SecurityValidator.sanitize_html(content)
-            content = content[:3000]  # Reasonable content length limit
+            # Normalize and limit content length
+            content = self._normalize_text(content)[:3000]  # Reasonable content length limit
             
             if len(content) < 50:  # Skip articles with too little content
                 return None
             
-            return Article(title=sanitized_title, url=validated_url, content=content)
+            return Article(title=normalized_title, url=validated_url, content=content)
             
         except SecurityError as e:
             security_logger.warning(f"Security error scraping article {url}: {e}")
@@ -261,6 +292,71 @@ class NewsletterGenerator:
         except Exception as e:
             logger.error(f"Error scraping article {url}: {e}")
             return None
+    
+    def _resolve_source_identifier(self, source: str, available: Set[str]) -> Optional[str]:
+        """Resolve config entry to a known scraper key"""
+        if not source:
+            return None
+        normalized = source.strip().lower().rstrip('/')
+        if normalized in available:
+            return normalized
+        parsed = urlparse(normalized if normalized.startswith("http") else f"https://{normalized}")
+        host = parsed.netloc or parsed.path
+        for candidate in available:
+            if candidate in host:
+                return candidate
+        return None
+    
+    def _convert_scraped_articles(self, scraped_articles: List[ScraperArticle]) -> List[Article]:
+        """Normalize articles returned by ScraperManager"""
+        normalized_articles: List[Article] = []
+        for scraped in scraped_articles:
+            try:
+                validated_url = SecurityValidator.validate_url(scraped.url)
+            except SecurityError as exc:
+                security_logger.warning(f"Discarding article with invalid URL {scraped.url}: {exc}")
+                continue
+            
+            title = self._normalize_text(scraped.title)
+            content = self._normalize_text(scraped.content)[:3000]
+            
+            if not title or len(content) < 50:
+                continue
+            
+            normalized_articles.append(
+                Article(
+                    title=title,
+                    url=validated_url,
+                    content=content,
+                    published_date=scraped.published_date,
+                    relevance_score=0.0,
+                    category=""
+                )
+            )
+        return normalized_articles
+    
+    def collect_articles(self) -> List[Article]:
+        """Collect articles from configured sources"""
+        configured_sources = self.config.get("websites", [])
+        if not configured_sources:
+            configured_sources = ["hospitalogy"]
+        
+        articles: List[Article] = []
+        available = set(self.scraper_manager.get_available_websites())
+        
+        for source in configured_sources:
+            scraper_key = self._resolve_source_identifier(source, available)
+            if scraper_key == "hospitalogy":
+                articles.extend(self.scrape_hospitalogy())
+            elif scraper_key and scraper_key in available:
+                scraped = self.scraper_manager.scrape_website(scraper_key, limit=20)
+                articles.extend(self._convert_scraped_articles(scraped))
+            else:
+                logger.warning(f"Unsupported website source configured: {source}")
+        
+        if not articles:
+            logger.warning("No articles collected from configured sources.")
+        return articles
     
     def calculate_relevance_score(self, article: Article) -> float:
         """Calculate relevance score based on payer and innovation keywords"""
@@ -375,12 +471,8 @@ class NewsletterGenerator:
         """Create complete newsletter"""
         logger.info("Starting newsletter generation...")
         
-        # Collect articles from all sources
-        all_articles = []
-        
-        # Scrape hospitalogy.com
-        hospitalogy_articles = self.scrape_hospitalogy()
-        all_articles.extend(hospitalogy_articles)
+        # Collect articles from configured sources
+        all_articles = self.collect_articles()
         
         # Filter and rank articles
         relevant_articles = self.filter_articles(all_articles)
@@ -426,15 +518,13 @@ class NewsletterGenerator:
             # Validate filename
             validated_filename = SecurityValidator.validate_filename(filename)
             
-            # Sanitize content
-            sanitized_content = SecurityValidator.sanitize_html(content)
-            
             # Use secure file handler
             newsletters_dir = Path("newsletters")
             newsletters_dir.mkdir(exist_ok=True)
             
             file_handler = SecureFileHandler(str(newsletters_dir))
-            filepath = file_handler.safe_write_file(validated_filename, sanitized_content)
+            normalized_content = content if isinstance(content, str) else str(content)
+            filepath = file_handler.safe_write_file(validated_filename, normalized_content)
             
             logger.info(f"Newsletter saved to {filepath}")
             return filepath
@@ -453,8 +543,11 @@ class NewsletterGenerator:
                 subject = f"Healthcare Weekly Newsletter - {datetime.now().strftime('%B %d, %Y')}"
             
             # Sanitize inputs
-            sanitized_content = SecurityValidator.sanitize_html(content)
             sanitized_subject = SecurityValidator.sanitize_html(subject)
+            normalized_content = content if isinstance(content, str) else str(content)
+            escaped_content = html.escape(normalized_content)
+            if escaped_content != normalized_content:
+                logger.debug("HTML escaping modified the outbound email body to neutralize markup.")
             
             # Validate subject length
             if len(sanitized_subject) > 200:
@@ -486,7 +579,7 @@ class NewsletterGenerator:
             msg['Subject'] = sanitized_subject
             
             # Convert markdown to HTML with security controls
-            html_content = sanitized_content.replace('\n', '<br>')
+            html_content = escaped_content.replace('\n', '<br>')
             html_content = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', html_content)
             html_content = re.sub(r'\*(.*?)\*', r'<em>\1</em>', html_content)
             html_content = re.sub(r'# (.*?)$', r'<h1>\1</h1>', html_content, flags=re.MULTILINE)

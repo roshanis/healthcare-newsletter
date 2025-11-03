@@ -42,6 +42,9 @@ class SecurityValidator:
         r'(?::\d+)?'  # optional port
         r'(?:/?|[/?]\S+)$', re.IGNORECASE)
     
+    # Known scraper keys that do not require URL validation
+    KNOWN_WEBSITE_KEYS = {"hospitalogy", "healthcareitnews", "fiercehealthcare"}
+    
     @staticmethod
     def validate_url(url: str) -> str:
         """Validate and sanitize URL"""
@@ -148,7 +151,10 @@ class SecurityValidator:
             
             validated_websites = []
             for url in config_data['websites']:
-                validated_websites.append(SecurityValidator.validate_url(url))
+                if isinstance(url, str) and url.strip().lower() in SecurityValidator.KNOWN_WEBSITE_KEYS:
+                    validated_websites.append(url.strip())
+                else:
+                    validated_websites.append(SecurityValidator.validate_url(url))
             config_data['websites'] = validated_websites
         
         return config_data
